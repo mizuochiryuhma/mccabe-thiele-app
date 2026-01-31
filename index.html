@@ -4,7 +4,10 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>McCabe–Thiele 階段作図（2成分）</title>
+
+  <!-- グラフ描画ライブラリ Plotly（ネット環境でCDNが使えない場合はローカル配置に差し替え可能） -->
   <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+
   <style>
     body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; margin: 16px; }
     .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
@@ -20,17 +23,20 @@
     .note { color: #555; font-size: 12px; line-height: 1.5; }
   </style>
 </head>
+
 <body>
   <h2>蒸留塔 理論段数（McCabe–Thiele 階段作図）</h2>
 
   <div class="wrap">
+    <!-- 左：入力・結果 -->
     <div class="card">
-      <h3>1) 平衡データ（x,y）</h3>
+      <h3>1) 平衡データ（x, y）</h3>
       <div class="note">
         - 1行に1点： <span class="mono">x, y</span>（0〜1）<br/>
-        - x昇順を推奨（自動でソートします）<br/>
-        - 単調増加（通常の2成分VLE想定）
+        - x昇順推奨（内部で自動ソート）<br/>
+        - 通常の2成分VLEを想定し、yはxとともに増える（単調増加）前提
       </div>
+
       <textarea id="xyInput">0.00, 0.00
 0.05, 0.20
 0.10, 0.33
@@ -73,82 +79,125 @@
       <div class="result" id="resultBox">—</div>
 
       <div class="note" style="margin-top:10px;">
-        注意：<br/>
-        - 本実装は「全縮流（q=1）」相当の簡略：<b>Fは濃縮線と x=Xf の交点</b>として扱います。<br/>
-        - q線を入れる版（一般の原料熱状態）に拡張したい場合は、最後に追記します。
+        授業用メモ：<br/>
+        - この版は簡略化として <b>q線（原料熱状態）を入れない</b> 作りです。<br/>
+        - その代わり、点Fは「濃縮線と x=Xf の交点」として決めています。<br/>
+        - まずは階段作図の仕組み（水平→垂直の繰り返し）を体感するのが目的です。
       </div>
     </div>
 
+    <!-- 右：グラフ -->
     <div class="card">
       <div id="plot" style="height: 78vh;"></div>
     </div>
   </div>
 
 <script>
-/* -----------------------------
-   ユーティリティ
------------------------------- */
-function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+/* ============================================================
+  0. このプログラムがやっていること（全体像）
+  ------------------------------------------------------------
+  ① 平衡データ (x,y) を読み取る
+  ② 点の間をなめらかにつないで「平衡曲線」を作る（補間）
+  ③ Xd, Xf, Xw, R から「操作線（濃縮線・回収線）」を作る
+  ④ McCabe–Thiele の階段作図を自動で描く
+  ⑤ 段数（原料段・ステップ数・理論段数）を計算して表示
+============================================================ */
 
+
+/* ============================================================
+  1. 便利な小道具（ユーティリティ）
+============================================================ */
+
+/**
+ * 値を0〜1に収める（モル分率は0〜1なので）
+ */
+function clamp01(v){
+  return Math.max(0, Math.min(1, v));
+}
+
+/**
+ * テキスト欄の "x, y" を読み取り、数値配列 xs, ys にする
+ * - xで昇順ソート
+ * - 同じxがあったら最後のyを採用
+ */
 function parseXY(text){
   const rows = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const pts = [];
+
   for(const r of rows){
+    // カンマや空白で分割（"0.1, 0.3" でも "0.1 0.3" でもOKにする）
     const m = r.split(/[, \t]+/).map(s => s.trim()).filter(Boolean);
     if(m.length < 2) continue;
-    const x = Number(m[0]), y = Number(m[1]);
+
+    const x = Number(m[0]);
+    const y = Number(m[1]);
     if(Number.isFinite(x) && Number.isFinite(y)) pts.push([x,y]);
   }
+
   if(pts.length < 2) throw new Error("平衡データが不足しています（2点以上必要）");
-  // xでソート、同一xは最後を採用
+
+  // xの小さい順に並べ替え
   pts.sort((a,b)=>a[0]-b[0]);
+
+  // 同じxが連続した場合は最後を採用（簡易に重複をつぶす）
   const xs=[], ys=[];
   for(const [x,y] of pts){
     if(xs.length && Math.abs(x - xs[xs.length-1]) < 1e-12){
       ys[ys.length-1] = y;
-    } else {
-      xs.push(x); ys.push(y);
+    }else{
+      xs.push(clamp01(x));
+      ys.push(clamp01(y));
     }
   }
-  // 0..1への軽いガード
-  for(let i=0;i<xs.length;i++){
-    xs[i]=clamp01(xs[i]);
-    ys[i]=clamp01(ys[i]);
-  }
+
   return {xs, ys};
 }
 
-/* -----------------------------
-   PCHIP（単調性保持の3次補間）
-   参考：Fritsch–Carlson 法の考え方
------------------------------- */
+
+/* ============================================================
+  2. 平衡曲線を「なめらか」にする（PCHIP補間）
+  ------------------------------------------------------------
+  生徒向け説明：
+  - 入力点の間をなめらかにつないで曲線を作りたい
+  - ただし変な「うねり（山や谷）」が出ると平衡曲線らしくない
+  - PCHIPは「単調増加を崩しにくい」補間方法
+============================================================ */
+
+/**
+ * PCHIP用：各点の傾き m[i] を決める
+ * （ここは難しいので、授業では “曲線をきれいにつなぐための計算” と割り切ってOK）
+ */
 function pchipSlopes(x, y){
   const n = x.length;
   const h = new Array(n-1);
   const d = new Array(n-1);
+
   for(let i=0;i<n-1;i++){
     h[i] = x[i+1]-x[i];
-    if(h[i] <= 0) throw new Error("xは厳密に昇順である必要があります（同一xは自動処理済みのはずです）");
+    if(h[i] <= 0) throw new Error("xは昇順である必要があります（同一xは内部で処理済みのはず）");
     d[i] = (y[i+1]-y[i])/h[i];
   }
+
   const m = new Array(n).fill(0);
 
-  // 端点
+  // 端（最初と最後）は近い区間の傾きを採用
   m[0] = d[0];
   m[n-1] = d[n-2];
 
-  // 内点
+  // 内側の点は、前後の傾き d[i-1], d[i] を見て決める
   for(let i=1;i<=n-2;i++){
+    // 前後で符号が変わる（増加→減少など）ときは傾きを0にして“変な曲がり”を抑える
     if(d[i-1] === 0 || d[i] === 0 || (d[i-1] > 0) !== (d[i] > 0)){
       m[i] = 0;
-    } else {
+    }else{
+      // 加重調和平均（大きすぎる傾きになりにくい）
       const w1 = 2*h[i] + h[i-1];
       const w2 = h[i] + 2*h[i-1];
-      m[i] = (w1 + w2) / (w1/d[i-1] + w2/d[i]); // 加重調和平均
+      m[i] = (w1 + w2) / (w1/d[i-1] + w2/d[i]);
     }
   }
 
-  // 端点の過大傾き抑制（簡易）
+  // 端点の傾きが大きすぎる場合の抑制（簡易）
   function fixEnd(i0, i1){
     const di = d[i0];
     if(di === 0){ m[i1]=0; return; }
@@ -162,29 +211,43 @@ function pchipSlopes(x, y){
   return m;
 }
 
+/**
+ * PCHIP補間：xqを入れると補間yを返す
+ */
 function pchipEval(x, y, m, xq){
   const n = x.length;
   if(xq <= x[0]) return y[0];
   if(xq >= x[n-1]) return y[n-1];
-  // 区間探索（線形）
+
+  // xqがどの区間にあるか探す（簡易に順番に探す）
   let i = 0;
   while(i < n-1 && xq > x[i+1]) i++;
+
+  // その区間で3次式により補間
   const h = x[i+1]-x[i];
   const t = (xq - x[i]) / h;
   const t2 = t*t, t3 = t2*t;
+
   const h00 =  2*t3 - 3*t2 + 1;
   const h10 =      t3 - 2*t2 + t;
   const h01 = -2*t3 + 3*t2;
   const h11 =      t3 -   t2;
+
   return h00*y[i] + h10*h*m[i] + h01*y[i+1] + h11*h*m[i+1];
 }
 
-// y_eq(x) と x_eq(y)（単調増加を仮定し二分探索）
+/**
+ * 平衡曲線の関数を用意する
+ * - yEq(x)：x→平衡y
+ * - xInv(y)：y→平衡x（階段作図で必要！）
+ */
 function makeEquilibriumFuncs(xs, ys){
   const m = pchipSlopes(xs, ys);
+
+  // yEq(x)：平衡曲線（なめらか）
   const yEq = (x)=> clamp01(pchipEval(xs, ys, m, clamp01(x)));
 
-  // 逆関数（与えたyに対するxを二分探索）
+  // xInv(y)：逆関数（単調増加を仮定して二分探索で求める）
   const xInv = (yTarget)=>{
     yTarget = clamp01(yTarget);
     let lo = xs[0], hi = xs[xs.length-1];
@@ -195,51 +258,79 @@ function makeEquilibriumFuncs(xs, ys){
     }
     return (lo+hi)/2;
   };
+
   return { yEq, xInv };
 }
 
-/* -----------------------------
-   操作線
-   rectifying: y = (R/(R+1)) x + Xd/(R+1)
-   stripping:  2点(F,W)を通る直線
------------------------------- */
+
+/* ============================================================
+  3. 操作線（濃縮線・回収線）
+  ------------------------------------------------------------
+  濃縮線（上部操作線）：
+    y = (R/(R+1))x + (Xd/(R+1))
+  回収線（下部操作線）：
+    点Fと点Wを結ぶ直線
+============================================================ */
+
+/**
+ * 濃縮線（上部操作線）を返す関数 yRect(x)
+ */
 function rectifyingLine(R, Xd){
   const a = R/(R+1);
   const b = Xd/(R+1);
   return (x)=> a*x + b;
 }
 
+/**
+ * 2点 (x1,y1), (x2,y2) を通る直線を返す
+ */
 function lineThrough(p1, p2){
   const [x1,y1]=p1, [x2,y2]=p2;
   const dx = x2-x1;
-  if(Math.abs(dx) < 1e-15) throw new Error("直線が定義できません（xが同じ点）");
+  if(Math.abs(dx) < 1e-15) throw new Error("直線が定義できません（xが同じ点です）");
   const a = (y2-y1)/dx;
   const b = y1 - a*x1;
   return (x)=> a*x + b;
 }
 
-/* -----------------------------
-   階段作図（自動）
-   1) (Xd,Xd) から開始（対角線上）
-   2) 水平 → 平衡曲線 (x = xInv(y))
-   3) 垂直 → 操作線 (y = yOp(x))
-   4) 繰り返し
-   5) Xfを跨いだ最初の段を「原料段（整数）」として採用
-   6) Xwを跨ぐ最後の段は x方向比で小数段を推定（小数1位）
------------------------------- */
+
+/* ============================================================
+  4. 階段作図（McCabe–Thieleの核心）
+  ------------------------------------------------------------
+  生徒向けの最重要ポイント：
+  - 階段は「水平→垂直」を繰り返すだけ
+  - 水平：平衡曲線へ（y一定） → xInv(y) を使う
+  - 垂直：操作線へ（x一定） → yOp(x) を使う
+============================================================ */
+
+/**
+ * 階段作図を計算して、描画用の点列と段数を返す
+ * 入力：
+ *  - eq: {yEq, xInv}
+ *  - Xd, Xf, Xw, R
+ */
 function buildStairs(params){
   const {yEq, xInv} = params.eq;
   const {Xd, Xf, Xw, R} = params;
 
+  // 重要点 D, F, W を決める
+  // D：対角線と x=Xd の交点 → (Xd, Xd)
+  const D = [Xd, Xd];
+
+  // 濃縮線
   const yRect = rectifyingLine(R, Xd);
 
-  // 点D, F, W
-  const D = [Xd, Xd];
-  const F = [Xf, yRect(Xf)]; // 本仕様（q線無し）としてここを採用
+  // この簡略版では F を「濃縮線と x=Xf の交点」とする
+  const F = [Xf, yRect(Xf)];
+
+  // W：対角線と x=Xw の交点 → (Xw, Xw)
   const W = [Xw, Xw];
 
+  // 回収線（FとWを結ぶ）
   const yStrip = lineThrough(F, W);
 
+  // 操作線（上：濃縮線、下：回収線）をまとめた関数
+  // xがXf以上なら上部、Xf未満なら下部
   const yOp = (x)=>{
     return (x >= Xf) ? yRect(x) : yStrip(x);
   };
@@ -248,98 +339,110 @@ function buildStairs(params){
   const pts = [];
   pts.push(D);
 
-  let stages = 0;
-  let feedStage = null; // 整数
-  let totalSteps = 0;   // 小数も含む推定
+  // 段数カウント用
+  let stagesInteger = 0;  // 完全な段の数（整数部）
+  let feedStage = null;   // 原料段（整数として求める）
+  let totalSteps = 0;     // Wを越える段数（小数も含む）
 
-  // “水平到達点”のxを見てカウントする
-  let xPrevEq = Xd; // 直前の平衡到達x（初期はXd）
+  // 現在位置（最初はD）
   let yCurr = Xd;
-  let xCurr = Xd;
+  let xPrevEq = Xd; // 直前の「平衡曲線に当てたx」
 
   const maxIter = 500;
   const eps = 1e-6;
 
   for(let iter=0; iter<maxIter; iter++){
-    // 水平：y=yCurr で平衡曲線へ
+
+    /* ---- (1) 水平：平衡曲線へ当てる ----
+       yは一定（= yCurr）なので、xInv(yCurr) で平衡曲線上のxを求める
+    */
     const xEq = xInv(yCurr);
-    const yEqPoint = yCurr;
+    pts.push([xEq, yCurr]); // 水平線の終点
 
-    // 水平線を描画
-    pts.push([xEq, yEqPoint]);
-
-    // 原料段（最初に xEq < Xf になった段を整数で記録）
+    // 原料段：初めて xEq が Xf を下回った段を「原料段」とする
     if(feedStage === null && xEq < Xf - eps){
-      feedStage = stages + 1; // いま作ったこの段を原料段として扱う
+      feedStage = stagesInteger + 1;
     }
 
-    // もし底（Xw）を跨いだら、最後の段を小数で推定して終了
+    /* ---- (2) 底（Xw）を越えたら終了（最後だけ小数段） ---- */
     if(xEq <= Xw + eps){
-      // 小数段：xPrevEq -> xEq の区間で Xw に到達する割合
-      // （xが単調に減少する前提）
+
+      // 最後の段は、x方向の割合で「何段分進んだか」を小数で推定
+      // 例：1段の途中でWに到達したら 0.3段 など
       const denom = (xPrevEq - xEq);
       let frac = 1.0;
+
       if(Math.abs(denom) > 1e-12){
-        frac = (xPrevEq - Xw) / denom; // 0〜1程度
+        frac = (xPrevEq - Xw) / denom; // 0〜1
         frac = Math.max(0, Math.min(1, frac));
       }
-      totalSteps = stages + frac;
-      // 仕上げに、Wへ“見た目上”合わせる補助線（任意）
-      pts.push([Xw, yEqPoint]); // 水平をXwまで
-      pts.push([Xw, Xw]);       // 垂直で対角線へ
+
+      totalSteps = stagesInteger + frac;
+
+      // 見た目をWに合わせる補助点（任意：図が見やすくなる）
+      pts.push([Xw, yCurr]); // 水平でx=Xwへ
+      pts.push([Xw, Xw]);    // 垂直で対角線へ
+
       break;
     }
 
-    // 垂直：操作線へ
+    /* ---- (3) 垂直：操作線へ当てる ----
+       xは一定（= xEq）なので、yOp(xEq) で操作線上のyを求める
+    */
     const yNext = yOp(xEq);
-    pts.push([xEq, yNext]);
+    pts.push([xEq, yNext]); // 垂直線の終点
 
-    // 次へ
-    stages += 1;
+    // 1段進んだ
+    stagesInteger += 1;
+
+    // 次のループへ更新
     xPrevEq = xEq;
-    xCurr = xEq;
     yCurr = yNext;
-
-    // 収束停止：ほぼW付近
-    if(xCurr <= Xw + eps && Math.abs(yCurr - Xw) < 5e-3){
-      totalSteps = stages;
-      break;
-    }
   }
 
-  if(feedStage === null){
-    // Xfを跨がない（極端条件など）
-    feedStage = stages; // 便宜上
-  }
+  // feedStageが見つからない場合は、入力条件が特殊（ほぼ上部のみ等）
+  if(feedStage === null) feedStage = stagesInteger;
 
-  // ステップ数（小数1位）
-  const steps1 = Math.round(totalSteps * 10) / 10;
+  // 小数1位で表示
+  const stepCount = Math.round(totalSteps * 10) / 10;
 
-  // 理論段数 = ステップ数 - 1（リボイラー分）
-  const theoretical = Math.round((steps1 - 1) * 10) / 10;
+  // 理論段数：ステップ数 - 1（リボイラー分を引く）
+  const theoreticalStages = Math.round((stepCount - 1) * 10) / 10;
 
   return {
     D, F, W,
     yRect, yStrip,
     stairPts: pts,
     feedStage,
-    stepCount: steps1,
-    theoreticalStages: theoretical
+    stepCount,
+    theoreticalStages
   };
 }
 
-/* -----------------------------
-   Plotly 描画
------------------------------- */
+
+/* ============================================================
+  5. 描画（Plotly）と結果表示
+============================================================ */
+
+/**
+ * 全部まとめて実行する「司令塔」
+ * - 入力を読む
+ * - 平衡曲線を作る
+ * - 操作線・階段作図を作る
+ * - Plotlyで描く
+ * - 結果を表示
+ */
 function drawAll(){
+  // (1) 平衡データ読み取り
   let xs, ys;
   try{
     ({xs, ys} = parseXY(document.getElementById("xyInput").value));
-  } catch(e){
+  }catch(e){
     alert(e.message);
     return;
   }
 
+  // (2) 条件読み取り
   const Xd = clamp01(Number(document.getElementById("Xd").value));
   const Xf = clamp01(Number(document.getElementById("Xf").value));
   const Xw = clamp01(Number(document.getElementById("Xw").value));
@@ -349,66 +452,65 @@ function drawAll(){
     alert("環流比Rが不正です");
     return;
   }
+
+  // 通常の蒸留では Xw < Xf < Xd が多いので軽く注意
   if(!(Xw < Xf && Xf < Xd)){
-    alert("通常は Xw < Xf < Xd になるように入力してください");
-    // 続行は可能だが、結果が直感とずれるので警告
+    alert("通常は Xw < Xf < Xd になるように入力してください（続行は可能）");
   }
 
+  // (3) 平衡曲線の関数を準備
   const eq = makeEquilibriumFuncs(xs, ys);
 
-  // 平衡曲線（滑らか線）
+  // (4) 階段作図を作る（D,F,W、操作線、段数もここで出る）
+  const stairs = buildStairs({eq, Xd, Xf, Xw, R});
+
+  // (5) グラフ用データを準備
   const gridN = 400;
   const xGrid = [];
-  const yGrid = [];
+  const yEqGrid = [];
+  const yRectGrid = [];
+  const yStripGrid = [];
+
   for(let i=0;i<gridN;i++){
     const x = i/(gridN-1);
     xGrid.push(x);
-    yGrid.push(eq.yEq(x));
-  }
-
-  const stairs = buildStairs({eq, Xd, Xf, Xw, R});
-
-  // 操作線用の線分
-  const xLine = [];
-  const yRectLine = [];
-  const yStripLine = [];
-  for(let i=0;i<gridN;i++){
-    const x = i/(gridN-1);
-    xLine.push(x);
-    yRectLine.push(stairs.yRect(x));
-    yStripLine.push(stairs.yStrip(x));
+    yEqGrid.push(eq.yEq(x));
+    yRectGrid.push(stairs.yRect(x));
+    yStripGrid.push(stairs.yStrip(x));
   }
 
   // 階段点列
   const sx = stairs.stairPts.map(p=>p[0]);
   const sy = stairs.stairPts.map(p=>p[1]);
 
+  // 対角線
   const diagX = [0,1], diagY = [0,1];
 
+  // (6) Plotlyで描画
   const traces = [
     // 対角線
     { x: diagX, y: diagY, mode:"lines", name:"対角線 y=x", line:{width:2, dash:"dot"} },
 
     // 平衡曲線（滑らか）
-    { x: xGrid, y: yGrid, mode:"lines", name:"平衡曲線（補間）", line:{width:3} },
+    { x: xGrid, y: yEqGrid, mode:"lines", name:"平衡曲線（補間）", line:{width:3} },
 
-    // 入力点（マーカー見やすく）
+    // 入力点（マーカーを大きめに）
     { x: xs, y: ys, mode:"markers", name:"平衡データ点",
       marker:{size:10, symbol:"circle", line:{width:1}}
     },
 
     // 濃縮線
-    { x: xLine, y: yRectLine, mode:"lines", name:"濃縮線（操作線 上部）", line:{width:2} },
+    { x: xGrid, y: yRectGrid, mode:"lines", name:"濃縮線（操作線 上部）", line:{width:2} },
 
     // 回収線
-    { x: xLine, y: yStripLine, mode:"lines", name:"回収線（操作線 下部）", line:{width:2, dash:"dash"} },
+    { x: xGrid, y: yStripGrid, mode:"lines", name:"回収線（操作線 下部）", line:{width:2, dash:"dash"} },
 
     // 階段
     { x: sx, y: sy, mode:"lines+markers", name:"階段作図",
       line:{width:2}, marker:{size:6}
     },
 
-    // 重要点D,F,W
+    // D/F/W
     { x:[stairs.D[0], stairs.F[0], stairs.W[0]],
       y:[stairs.D[1], stairs.F[1], stairs.W[1]],
       mode:"markers+text",
@@ -429,9 +531,10 @@ function drawAll(){
 
   Plotly.newPlot("plot", traces, layout, {displayModeBar:true, responsive:true});
 
-  // 結果表示
+  // (7) 結果表示
   const yIntercept = Xd/(R+1);
-  const result = `
+
+  document.getElementById("resultBox").innerHTML = `
     <div>
       <b>濃縮線 y切片</b>：Xd/(R+1) = <span class="mono">${yIntercept.toFixed(4)}</span><br/>
       <b>点D</b>：(${stairs.D[0].toFixed(4)}, ${stairs.D[1].toFixed(4)})<br/>
@@ -443,10 +546,17 @@ function drawAll(){
       <b>理論段数（ステップ数 − 1：リボイラー分）</b>：<span class="mono">${stairs.theoreticalStages.toFixed(1)}</span>
     </div>
   `;
-  document.getElementById("resultBox").innerHTML = result;
 }
 
+
+/* ============================================================
+  6. ボタン・初期動作
+============================================================ */
+
+// 「作図・計算」ボタン
 document.getElementById("drawBtn").addEventListener("click", drawAll);
+
+// 「デモ値に戻す」ボタン（入力を初期値へ戻す）
 document.getElementById("demoBtn").addEventListener("click", ()=>{
   document.getElementById("xyInput").value =
 `0.00, 0.00
@@ -461,14 +571,18 @@ document.getElementById("demoBtn").addEventListener("click", ()=>{
 0.80, 0.93
 0.90, 0.97
 1.00, 1.00`;
+
   document.getElementById("Xd").value = "0.95";
   document.getElementById("Xf").value = "0.50";
   document.getElementById("Xw").value = "0.05";
   document.getElementById("R").value  = "2.0";
+
   drawAll();
 });
 
+// ページを開いたら最初に描く
 drawAll();
 </script>
 </body>
 </html>
+
