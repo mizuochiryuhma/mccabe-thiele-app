@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>McCabe–Thiele 階段作図（2成分）</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", "Noto Sans JP", sans-serif; margin: 16px; }
+    .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }
+    textarea { width: 100%; height: 180px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    input[type="number"] { width: 100%; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 12px; }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px; }
+    button { padding: 10px; border-radius: 10px; border: 1px solid #ccc; background: #fafafa; cursor: pointer; }
+    button:hover { background: #f0f0f0; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .result { line-height: 1.7; }
+    .note { color: #555; font-size: 12px; line-height: 1.5; }
+  </style>
+</head>
+<body>
+  <h2>蒸留塔 理論段数（McCabe–Thiele 階段作図）</h2>
+
+  <div class="wrap">
+    <div class="card">
+      <h3>1) 平衡データ（x,y）</h3>
+      <div class="note">
+        - 1行に1点： <span class="mono">x, y</span>（0〜1）<br/>
+        - x昇順を推奨（自動でソートします）<br/>
+        - 単調増加（通常の2成分VLE想定）
+      </div>
+      <textarea id="xyInput">0.00, 0.00
+0.05, 0.20
+0.10, 0.33
+0.20, 0.50
+0.30, 0.62
+0.40, 0.71
+0.50, 0.78
+0.60, 0.84
+0.70, 0.89
+0.80, 0.93
+0.90, 0.97
+1.00, 1.00</textarea>
+
+      <h3 style="margin-top:14px;">2) 条件入力</h3>
+      <div class="row">
+        <div>
+          <label>Xd（塔頂）</label>
+          <input id="Xd" type="number" step="0.001" min="0" max="1" value="0.95">
+        </div>
+        <div>
+          <label>Xf（原料）</label>
+          <input id="Xf" type="number" step="0.001" min="0" max="1" value="0.50">
+        </div>
+        <div>
+          <label>Xw（缶出）</label>
+          <input id="Xw" type="number" step="0.001" min="0" max="1" value="0.05">
+        </div>
+        <div>
+          <label>環流比 R</label>
+          <input id="R" type="number" step="0.001" min="0" value="2.0">
+        </div>
+      </div>
+
+      <div class="btns">
+        <button id="drawBtn">作図・計算</button>
+        <button id="demoBtn">デモ値に戻す</button>
+      </div>
+
+      <h3 style="margin-top:14px;">3) 結果</h3>
+      <div class="result" id="resultBox">—</div>
+
+      <div class="note" style="margin-top:10px;">
+        注意：<br/>
+        - 本実装は「全縮流（q=1）」相当の簡略：<b>Fは濃縮線と x=Xf の交点</b>として扱います。<br/>
+        - q線を入れる版（一般の原料熱状態）に拡張したい場合は、最後に追記します。
+      </div>
+    </div>
+
+    <div class="card">
+      <div id="plot" style="height: 78vh;"></div>
+    </div>
+  </div>
+
+<script>
+/* -----------------------------
+   ユーティリティ
+------------------------------ */
+function clamp01(v){ return Math.max(0, Math.min(1, v)); }
+
+function parseXY(text){
+  const rows = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const pts = [];
+  for(const r of rows){
+    const m = r.split(/[, \t]+/).map(s => s.trim()).filter(Boolean);
+    if(m.length < 2) continue;
+    const x = Number(m[0]), y = Number(m[1]);
+    if(Number.isFinite(x) && Number.isFinite(y)) pts.push([x,y]);
+  }
+  if(pts.length < 2) throw new Error("平衡データが不足しています（2点以上必要）");
+  // xでソート、同一xは最後を採用
+  pts.sort((a,b)=>a[0]-b[0]);
+  const xs=[], ys=[];
+  for(const [x,y] of pts){
+    if(xs.length && Math.abs(x - xs[xs.length-1]) < 1e-12){
+      ys[ys.length-1] = y;
+    } else {
+      xs.push(x); ys.push(y);
+    }
+  }
+  // 0..1への軽いガード
+  for(let i=0;i<xs.length;i++){
+    xs[i]=clamp01(xs[i]);
+    ys[i]=clamp01(ys[i]);
+  }
+  return {xs, ys};
+}
+
+/* -----------------------------
+   PCHIP（単調性保持の3次補間）
+   参考：Fritsch–Carlson 法の考え方
+------------------------------ */
+function pchipSlopes(x, y){
+  const n = x.length;
+  const h = new Array(n-1);
+  const d = new Array(n-1);
+  for(let i=0;i<n-1;i++){
+    h[i] = x[i+1]-x[i];
+    if(h[i] <= 0) throw new Error("xは厳密に昇順である必要があります（同一xは自動処理済みのはずです）");
+    d[i] = (y[i+1]-y[i])/h[i];
+  }
+  const m = new Array(n).fill(0);
+
+  // 端点
+  m[0] = d[0];
+  m[n-1] = d[n-2];
+
+  // 内点
+  for(let i=1;i<=n-2;i++){
+    if(d[i-1] === 0 || d[i] === 0 || (d[i-1] > 0) !== (d[i] > 0)){
+      m[i] = 0;
+    } else {
+      const w1 = 2*h[i] + h[i-1];
+      const w2 = h[i] + 2*h[i-1];
+      m[i] = (w1 + w2) / (w1/d[i-1] + w2/d[i]); // 加重調和平均
+    }
+  }
+
+  // 端点の過大傾き抑制（簡易）
+  function fixEnd(i0, i1){
+    const di = d[i0];
+    if(di === 0){ m[i1]=0; return; }
+    const sign = Math.sign(di);
+    if(Math.sign(m[i1]) !== sign) m[i1] = 0;
+    if(Math.abs(m[i1]) > 3*Math.abs(di)) m[i1] = 3*di;
+  }
+  fixEnd(0,0);
+  fixEnd(n-2,n-1);
+
+  return m;
+}
+
+function pchipEval(x, y, m, xq){
+  const n = x.length;
+  if(xq <= x[0]) return y[0];
+  if(xq >= x[n-1]) return y[n-1];
+  // 区間探索（線形）
+  let i = 0;
+  while(i < n-1 && xq > x[i+1]) i++;
+  const h = x[i+1]-x[i];
+  const t = (xq - x[i]) / h;
+  const t2 = t*t, t3 = t2*t;
+  const h00 =  2*t3 - 3*t2 + 1;
+  const h10 =      t3 - 2*t2 + t;
+  const h01 = -2*t3 + 3*t2;
+  const h11 =      t3 -   t2;
+  return h00*y[i] + h10*h*m[i] + h01*y[i+1] + h11*h*m[i+1];
+}
+
+// y_eq(x) と x_eq(y)（単調増加を仮定し二分探索）
+function makeEquilibriumFuncs(xs, ys){
+  const m = pchipSlopes(xs, ys);
+  const yEq = (x)=> clamp01(pchipEval(xs, ys, m, clamp01(x)));
+
+  // 逆関数（与えたyに対するxを二分探索）
+  const xInv = (yTarget)=>{
+    yTarget = clamp01(yTarget);
+    let lo = xs[0], hi = xs[xs.length-1];
+    for(let k=0;k<60;k++){
+      const mid = (lo+hi)/2;
+      const ymid = yEq(mid);
+      if(ymid < yTarget) lo = mid; else hi = mid;
+    }
+    return (lo+hi)/2;
+  };
+  return { yEq, xInv };
+}
+
+/* -----------------------------
+   操作線
+   rectifying: y = (R/(R+1)) x + Xd/(R+1)
+   stripping:  2点(F,W)を通る直線
+------------------------------ */
+function rectifyingLine(R, Xd){
+  const a = R/(R+1);
+  const b = Xd/(R+1);
+  return (x)=> a*x + b;
+}
+
+function lineThrough(p1, p2){
+  const [x1,y1]=p1, [x2,y2]=p2;
+  const dx = x2-x1;
+  if(Math.abs(dx) < 1e-15) throw new Error("直線が定義できません（xが同じ点）");
+  const a = (y2-y1)/dx;
+  const b = y1 - a*x1;
+  return (x)=> a*x + b;
+}
+
+/* -----------------------------
+   階段作図（自動）
+   1) (Xd,Xd) から開始（対角線上）
+   2) 水平 → 平衡曲線 (x = xInv(y))
+   3) 垂直 → 操作線 (y = yOp(x))
+   4) 繰り返し
+   5) Xfを跨いだ最初の段を「原料段（整数）」として採用
+   6) Xwを跨ぐ最後の段は x方向比で小数段を推定（小数1位）
+------------------------------ */
+function buildStairs(params){
+  const {yEq, xInv} = params.eq;
+  const {Xd, Xf, Xw, R} = params;
+
+  const yRect = rectifyingLine(R, Xd);
+
+  // 点D, F, W
+  const D = [Xd, Xd];
+  const F = [Xf, yRect(Xf)]; // 本仕様（q線無し）としてここを採用
+  const W = [Xw, Xw];
+
+  const yStrip = lineThrough(F, W);
+
+  const yOp = (x)=>{
+    return (x >= Xf) ? yRect(x) : yStrip(x);
+  };
+
+  // 階段の点列（描画用）
+  const pts = [];
+  pts.push(D);
+
+  let stages = 0;
+  let feedStage = null; // 整数
+  let totalSteps = 0;   // 小数も含む推定
+
+  // “水平到達点”のxを見てカウントする
+  let xPrevEq = Xd; // 直前の平衡到達x（初期はXd）
+  let yCurr = Xd;
+  let xCurr = Xd;
+
+  const maxIter = 500;
+  const eps = 1e-6;
+
+  for(let iter=0; iter<maxIter; iter++){
+    // 水平：y=yCurr で平衡曲線へ
+    const xEq = xInv(yCurr);
+    const yEqPoint = yCurr;
+
+    // 水平線を描画
+    pts.push([xEq, yEqPoint]);
+
+    // 原料段（最初に xEq < Xf になった段を整数で記録）
+    if(feedStage === null && xEq < Xf - eps){
+      feedStage = stages + 1; // いま作ったこの段を原料段として扱う
+    }
+
+    // もし底（Xw）を跨いだら、最後の段を小数で推定して終了
+    if(xEq <= Xw + eps){
+      // 小数段：xPrevEq -> xEq の区間で Xw に到達する割合
+      // （xが単調に減少する前提）
+      const denom = (xPrevEq - xEq);
+      let frac = 1.0;
+      if(Math.abs(denom) > 1e-12){
+        frac = (xPrevEq - Xw) / denom; // 0〜1程度
+        frac = Math.max(0, Math.min(1, frac));
+      }
+      totalSteps = stages + frac;
+      // 仕上げに、Wへ“見た目上”合わせる補助線（任意）
+      pts.push([Xw, yEqPoint]); // 水平をXwまで
+      pts.push([Xw, Xw]);       // 垂直で対角線へ
+      break;
+    }
+
+    // 垂直：操作線へ
+    const yNext = yOp(xEq);
+    pts.push([xEq, yNext]);
+
+    // 次へ
+    stages += 1;
+    xPrevEq = xEq;
+    xCurr = xEq;
+    yCurr = yNext;
+
+    // 収束停止：ほぼW付近
+    if(xCurr <= Xw + eps && Math.abs(yCurr - Xw) < 5e-3){
+      totalSteps = stages;
+      break;
+    }
+  }
+
+  if(feedStage === null){
+    // Xfを跨がない（極端条件など）
+    feedStage = stages; // 便宜上
+  }
+
+  // ステップ数（小数1位）
+  const steps1 = Math.round(totalSteps * 10) / 10;
+
+  // 理論段数 = ステップ数 - 1（リボイラー分）
+  const theoretical = Math.round((steps1 - 1) * 10) / 10;
+
+  return {
+    D, F, W,
+    yRect, yStrip,
+    stairPts: pts,
+    feedStage,
+    stepCount: steps1,
+    theoreticalStages: theoretical
+  };
+}
+
+/* -----------------------------
+   Plotly 描画
+------------------------------ */
+function drawAll(){
+  let xs, ys;
+  try{
+    ({xs, ys} = parseXY(document.getElementById("xyInput").value));
+  } catch(e){
+    alert(e.message);
+    return;
+  }
+
+  const Xd = clamp01(Number(document.getElementById("Xd").value));
+  const Xf = clamp01(Number(document.getElementById("Xf").value));
+  const Xw = clamp01(Number(document.getElementById("Xw").value));
+  const R  = Number(document.getElementById("R").value);
+
+  if(!(R >= 0 && Number.isFinite(R))){
+    alert("環流比Rが不正です");
+    return;
+  }
+  if(!(Xw < Xf && Xf < Xd)){
+    alert("通常は Xw < Xf < Xd になるように入力してください");
+    // 続行は可能だが、結果が直感とずれるので警告
+  }
+
+  const eq = makeEquilibriumFuncs(xs, ys);
+
+  // 平衡曲線（滑らか線）
+  const gridN = 400;
+  const xGrid = [];
+  const yGrid = [];
+  for(let i=0;i<gridN;i++){
+    const x = i/(gridN-1);
+    xGrid.push(x);
+    yGrid.push(eq.yEq(x));
+  }
+
+  const stairs = buildStairs({eq, Xd, Xf, Xw, R});
+
+  // 操作線用の線分
+  const xLine = [];
+  const yRectLine = [];
+  const yStripLine = [];
+  for(let i=0;i<gridN;i++){
+    const x = i/(gridN-1);
+    xLine.push(x);
+    yRectLine.push(stairs.yRect(x));
+    yStripLine.push(stairs.yStrip(x));
+  }
+
+  // 階段点列
+  const sx = stairs.stairPts.map(p=>p[0]);
+  const sy = stairs.stairPts.map(p=>p[1]);
+
+  const diagX = [0,1], diagY = [0,1];
+
+  const traces = [
+    // 対角線
+    { x: diagX, y: diagY, mode:"lines", name:"対角線 y=x", line:{width:2, dash:"dot"} },
+
+    // 平衡曲線（滑らか）
+    { x: xGrid, y: yGrid, mode:"lines", name:"平衡曲線（補間）", line:{width:3} },
+
+    // 入力点（マーカー見やすく）
+    { x: xs, y: ys, mode:"markers", name:"平衡データ点",
+      marker:{size:10, symbol:"circle", line:{width:1}}
+    },
+
+    // 濃縮線
+    { x: xLine, y: yRectLine, mode:"lines", name:"濃縮線（操作線 上部）", line:{width:2} },
+
+    // 回収線
+    { x: xLine, y: yStripLine, mode:"lines", name:"回収線（操作線 下部）", line:{width:2, dash:"dash"} },
+
+    // 階段
+    { x: sx, y: sy, mode:"lines+markers", name:"階段作図",
+      line:{width:2}, marker:{size:6}
+    },
+
+    // 重要点D,F,W
+    { x:[stairs.D[0], stairs.F[0], stairs.W[0]],
+      y:[stairs.D[1], stairs.F[1], stairs.W[1]],
+      mode:"markers+text",
+      text:["D","F","W"],
+      textposition:"top center",
+      name:"D/F/W",
+      marker:{size:12, symbol:"diamond"}
+    }
+  ];
+
+  const layout = {
+    title: "McCabe–Thiele xy線図 & 階段作図",
+    xaxis: { title:"x（液相 低沸点成分モル分率）", range:[0,1], zeroline:false },
+    yaxis: { title:"y（気相 低沸点成分モル分率）", range:[0,1], zeroline:false, scaleanchor:"x", scaleratio:1 },
+    legend: { orientation:"h" },
+    margin: { l: 60, r: 20, t: 60, b: 60 }
+  };
+
+  Plotly.newPlot("plot", traces, layout, {displayModeBar:true, responsive:true});
+
+  // 結果表示
+  const yIntercept = Xd/(R+1);
+  const result = `
+    <div>
+      <b>濃縮線 y切片</b>：Xd/(R+1) = <span class="mono">${yIntercept.toFixed(4)}</span><br/>
+      <b>点D</b>：(${stairs.D[0].toFixed(4)}, ${stairs.D[1].toFixed(4)})<br/>
+      <b>点F</b>（濃縮線と x=Xf の交点）：(${stairs.F[0].toFixed(4)}, ${stairs.F[1].toFixed(4)})<br/>
+      <b>点W</b>：(${stairs.W[0].toFixed(4)}, ${stairs.W[1].toFixed(4)})<br/><br/>
+
+      <b>原料段（Fを越えた段数：整数）</b>：<span class="mono">${stairs.feedStage}</span><br/>
+      <b>ステップ数（Wを越えた段数：小数1位）</b>：<span class="mono">${stairs.stepCount.toFixed(1)}</span><br/>
+      <b>理論段数（ステップ数 − 1：リボイラー分）</b>：<span class="mono">${stairs.theoreticalStages.toFixed(1)}</span>
+    </div>
+  `;
+  document.getElementById("resultBox").innerHTML = result;
+}
+
+document.getElementById("drawBtn").addEventListener("click", drawAll);
+document.getElementById("demoBtn").addEventListener("click", ()=>{
+  document.getElementById("xyInput").value =
+`0.00, 0.00
+0.05, 0.20
+0.10, 0.33
+0.20, 0.50
+0.30, 0.62
+0.40, 0.71
+0.50, 0.78
+0.60, 0.84
+0.70, 0.89
+0.80, 0.93
+0.90, 0.97
+1.00, 1.00`;
+  document.getElementById("Xd").value = "0.95";
+  document.getElementById("Xf").value = "0.50";
+  document.getElementById("Xw").value = "0.05";
+  document.getElementById("R").value  = "2.0";
+  drawAll();
+});
+
+drawAll();
+</script>
+</body>
+</html>
